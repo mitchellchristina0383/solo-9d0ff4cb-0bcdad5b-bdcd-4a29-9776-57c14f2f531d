@@ -2,12 +2,18 @@
 # file on a named volume, mirroring the "two processes, one legacy database"
 # requirement. SQLite file locking works because the volume is a local
 # filesystem shared by containers on the same host (do NOT use NFS).
+#
+# Lock-contention diagnostics live in a SECOND SQLite file (lockdiag.db) on
+# the same shared volume, so both instances record into and read from one
+# diagnostics store even while the MAIN database is write-locked.
 services:
   app1:
     build: .
     environment:
       DB_PATH: /data/app.db
+      DIAG_DB_PATH: /data/lockdiag.db
       SERVER_NAME: app1
+      # BUSY_TIMEOUT_MS: "30000"  # write-lock wait budget; lower it to reproduce timeouts
     volumes:
       - dbdata:/data
     ports:
@@ -17,7 +23,9 @@ services:
     build: .
     environment:
       DB_PATH: /data/app.db
+      DIAG_DB_PATH: /data/lockdiag.db
       SERVER_NAME: app2
+      # BUSY_TIMEOUT_MS: "30000"
     volumes:
       - dbdata:/data
     ports:

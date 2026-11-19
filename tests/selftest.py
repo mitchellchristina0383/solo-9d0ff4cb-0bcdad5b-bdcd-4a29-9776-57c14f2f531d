@@ -13,12 +13,19 @@ SQLite database. Covers:
            orphans exist
   Phase C  concurrency storm: parallel scanner / fixers / deleters / bad
            writers / invariant monitor across both processes
+  Phase D  lock-contention diagnostics: diag_id on writes, live holder/waiter
+           view while the main DB is locked, failure honesty, hold-order vs.
+           real lock ownership, busy timeout (--timeout-test), SIGKILL ->
+           interrupted records (needs --restart-hook)
 
 Usage:
   python3 tests/selftest.py [--app1 8001] [--app2 8002] \
-      [--restart-hook "shell command to restart the app1 process"]
+      [--restart-hook "shell command to restart the app1 process"] \
+      [--timeout-test]
 
 For Docker Compose:  --restart-hook "docker compose restart app1"
+--timeout-test needs the apps started with a short busy timeout, e.g.
+  BUSY_TIMEOUT_MS=3000 bash scripts/local_up.sh
 """
 
 import argparse
@@ -434,12 +441,228 @@ def phase_c(app1, app2):
     expect("DELETE", app2, f"/services/{svc_ids[0]}", None, 409, "C5 delete referenced svc rejected after enable")
 
 
+# --------------------------------------------------------------------------- #
+# Phase D: cross-instance lock-contention diagnostics
+# --------------------------------------------------------------------------- #
+
+def phase_d(app1, app2, restart_hook, timeout_test):
+    print("== Phase D: cross-instance lock contention diagnostics ==")
+    uniq = uuid.uuid4().hex[:8]
+    results = {}
+
+    def fire(key, method, port, path, body=None):
+        try:
+            results[key] = req(method, port, path, body)
+        except Exception as exc:  # e.g. connection reset when the process is killed
+            results[key] = (-1, {"error": repr(exc)})
+
+    def record_of(key):
+        """(http status, lock event dict or None) for a fired request."""
+        st, js = results.get(key, (-1, {}))
+        diag_id = js.get("diag_id") if isinstance(js, dict) else None
+        if diag_id is None:
+            return st, None
+        st2, ev = req("GET", app2, f"/locks/events/{diag_id}")
+        return st, (ev if st2 == 200 else None)
+
+    # D1: every write returns a diagnostic id; the record is queryable from
+    # BOTH instances and shows op, instance, wait/hold durations, outcome.
+    st, js = req("POST", app1, "/services", {"name": f"diag-{uniq}"})
+    check(st == 201 and isinstance(js.get("diag_id"), int), "D1 write returns a diagnostic id")
+    st, ev = req("GET", app2, f"/locks/events/{js.get('diag_id')}")
+    check(st == 200 and ev.get("op") == "create_service" and ev.get("instance") == "app1",
+          "D1 record queryable cross-instance, shows op + instance")
+    check(ev.get("state") == "completed" and ev.get("outcome") == "committed",
+          "D1 successful write recorded as committed")
+    check(ev.get("wait_ms") is not None and ev.get("hold_ms") is not None
+          and ev["wait_ms"] >= 0 and ev["hold_ms"] >= 0,
+          "D1 wait and hold durations recorded")
+
+    # D1b: a FAILED write must be recorded as failed - never as a success.
+    st, js = req("POST", app1, "/services", {"name": f"diag-{uniq}"})  # duplicate -> 409
+    check(st == 409 and isinstance(js.get("diag_id"), int),
+          "D1b failed write still returns its diagnostic id")
+    st, ev = req("GET", app2, f"/locks/events/{js['diag_id']}")
+    check(st == 200 and ev.get("state") == "failed" and "committed" not in (ev.get("outcome") or ""),
+          "D1b failed write recorded as failed (not as success)")
+
+    # D2: contention - one holder, and a mix of waiters (deployment correction,
+    # validation step, reset, plain writes) queuing behind it, observed live.
+    # The hold must be comfortably SHORTER than the servers' busy timeout so
+    # the waiters survive the queue (D4 exercises the give-up path separately).
+    sx = expect("POST", app1, "/services", {"name": f"dx-{uniq}"}, 201, "D2 seed svc x")["id"]
+    sy = expect("POST", app1, "/services", {"name": f"dy-{uniq}"}, 201, "D2 seed svc y")["id"]
+    dep = expect("POST", app2, "/deployments", {"service_id": sx, "note": "to-correct"}, 201,
+                 "D2 seed deployment")["id"]
+
+    st, health1 = req("GET", app1, "/health")
+    busy_ms = health1.get("busy_timeout_ms", 30000)
+    HOLD_S = max(2.0, min(5.0, busy_ms / 1000 * 0.6))
+    th_hold = threading.Thread(target=fire,
+                               args=("hold", "POST", app1, f"/demo/hold-lock?seconds={HOLD_S}"))
+    th_hold.start()
+
+    # The holder must become visible from app2 WHILE the main DB is locked.
+    snap = None
+    t0 = time.time()
+    while time.time() - t0 < 5:
+        st, cur = req("GET", app2, "/locks/current")
+        if st == 200 and cur["holders"]:
+            snap = cur
+            break
+        time.sleep(0.1)
+    check(snap is not None, "D2 diagnostics readable while main DB write-locked; holder visible")
+    if snap:
+        check(len(snap["holders"]) == 1, "D2 exactly one holder")
+        h = snap["holders"][0]
+        check(h["op"] == "demo_hold_lock" and h["instance"] == "app1" and h.get("instance_live"),
+              "D2 holder is app1/demo_hold_lock and live")
+
+    waiter_specs = [
+        ("patch", "PATCH", app2, f"/deployments/{dep}", {"service_id": sy}),
+        ("step", "POST", app1, "/validation/step?batch_size=5", None),
+        ("reset", "POST", app2, "/demo/reset", None),
+        ("mk1", "POST", app1, "/services", {"name": f"w1-{uniq}"}),
+        ("mk2", "POST", app2, "/services", {"name": f"w2-{uniq}"}),
+    ]
+    threads = []
+    for key, m, p, path, body in waiter_specs:
+        t = threading.Thread(target=fire, args=(key, m, p, path, body))
+        t.start()
+        threads.append(t)
+        time.sleep(0.15)
+
+    # While the lock is still held, the waiter queue is visible from BOTH instances.
+    time.sleep(min(0.6, HOLD_S * 0.2))
+    st, cur2 = req("GET", app2, "/locks/current")
+    st1, cur1 = req("GET", app1, "/locks/current")
+    check(st == 200 and st1 == 200, "D2 /locks/current served by both instances during the hold")
+    waiter_ops = {w["op"] for w in cur2["waiters"]}
+    check({"patch_deployment", "validation_step", "demo_reset", "create_service"} <= waiter_ops,
+          f"D2 waiter queue shows the interleaved mix (got {sorted(waiter_ops)})")
+    check(len(cur2["waiters"]) >= 5, "D2 all five waiters queued")
+    q = [w["queued_at"] for w in cur2["waiters"]]
+    check(q == sorted(q), "D2 waiters listed in enqueue order")
+    check({w["id"] for w in cur1["waiters"]} == {w["id"] for w in cur2["waiters"]},
+          "D2 both instances report the same waiter set")
+
+    for t in threads:
+        t.join()
+    th_hold.join()
+
+    # Every participant's record must match what actually happened (a failure
+    # is never recorded as success).
+    expected_status = {"hold": (200,), "patch": (200, 404), "step": (409,),
+                       "reset": (200,), "mk1": (201,), "mk2": (201,)}
+    all_events = []
+    for key, want in expected_status.items():
+        http_st, ev = record_of(key)
+        check(http_st in want, f"D2 {key}: HTTP {http_st}, want one of {want}")
+        if ev is None:
+            check(False, f"D2 {key}: diagnostic record missing")
+            continue
+        all_events.append((key, ev))
+        if http_st < 300:
+            check(ev["state"] == "completed" and ev["outcome"] == "committed",
+                  f"D2 {key}: 2xx recorded as committed")
+        else:
+            check(ev["state"] == "failed" and "committed" not in (ev["outcome"] or ""),
+                  f"D2 {key}: error recorded as failed, not as success")
+        check(ev.get("acquired_at") is not None and ev.get("released_at") is not None,
+              f"D2 {key}: lock interval recorded")
+
+    # D3: the displayed hold order must correspond to actual lock ownership:
+    # sorted by acquisition time, hold intervals must not overlap, and the
+    # demo holder (which grabbed the lock first) comes first.
+    if (len(all_events) == len(expected_status)
+            and all(ev.get("acquired_at") is not None for _, ev in all_events)):
+        ordered = sorted(all_events, key=lambda kv: kv[1]["acquired_at"])
+        check(ordered[0][0] == "hold", "D3 the demo holder acquired the lock first")
+        overlap_ok = all(
+            ordered[i + 1][1]["acquired_at"] >= ordered[i][1]["released_at"] - 0.1
+            for i in range(len(ordered) - 1)
+        )
+        check(overlap_ok, "D3 hold intervals do not overlap (order matches real lock ownership)")
+        check(all(ev["wait_ms"] is not None and ev["wait_ms"] >= 0 for _, ev in all_events)
+              and all(ev["hold_ms"] is not None and ev["hold_ms"] >= 0 for _, ev in all_events),
+              "D3 wait/hold durations recorded for every participant")
+        hold_ev = dict(all_events)["hold"]
+        check(hold_ev["hold_ms"] >= HOLD_S * 800, "D3 holder held the lock for ~the requested time")
+        waits = [ev["wait_ms"] for k, ev in all_events if k != "hold"]
+        check(all(w >= 500 for w in waits), "D3 every waiter genuinely queued behind the holder")
+
+    # D4: busy timeout (only with --timeout-test and a short BUSY_TIMEOUT_MS).
+    if timeout_test:
+        st, health2 = req("GET", app2, "/health")
+        busy_ms = health2.get("busy_timeout_ms", 30000)
+        if busy_ms > 10000:
+            print(f"    (D4 skipped: app2 busy_timeout={busy_ms} ms; restart the apps with "
+                  f"BUSY_TIMEOUT_MS=3000 to run the timeout test)")
+        else:
+            hold_s = busy_ms / 1000 + 3
+            th = threading.Thread(target=fire, args=("slowhold", "POST", app1,
+                                                     f"/demo/hold-lock?seconds={hold_s}"))
+            th.start()
+            time.sleep(0.6)
+            t0 = time.time()
+            st, js = req("POST", app2, "/services", {"name": f"slow-{uniq}"})
+            waited = time.time() - t0
+            check(st == 503 and isinstance(js.get("diag_id"), int),
+                  "D4 waiter gives up with 503 (+diag_id) after busy timeout")
+            check(waited >= busy_ms / 1000 * 0.8,
+                  f"D4 waiter actually waited ~busy_timeout ({waited:.1f}s)")
+            st, ev = req("GET", app1, f"/locks/events/{js.get('diag_id')}")
+            check(st == 200 and ev.get("state") == "timeout"
+                  and "busy_timeout" in (ev.get("outcome") or ""),
+                  "D4 timeout recorded with reason")
+            check(ev.get("acquired_at") is None and ev.get("hold_ms") is None
+                  and (ev.get("wait_ms") or 0) >= busy_ms * 0.8,
+                  "D4 timeout record: never acquired, waited the full budget")
+            th.join(timeout=hold_s + 15)
+            st, js = results.get("slowhold", (-1, {}))
+            if isinstance(js, dict) and js.get("diag_id") is not None:
+                st2, ev2 = req("GET", app1, f"/locks/events/{js['diag_id']}")
+                check(st2 == 200 and ev2.get("state") == "completed",
+                      "D4 holder itself completed normally")
+
+    # D5: SIGKILL the holder mid-hold. The unfinished record must be marked
+    # 'interrupted' at restart and must not keep posing as the lock holder.
+    if restart_hook:
+        th = threading.Thread(target=fire, args=("doomed", "POST", app1,
+                                                 "/demo/hold-lock?seconds=30"))
+        th.start()
+        doomed_id = None
+        t0 = time.time()
+        while time.time() - t0 < 5:
+            st, cur = req("GET", app2, "/locks/current")
+            if st == 200 and cur["holders"]:
+                doomed_id = cur["holders"][0]["id"]
+                break
+            time.sleep(0.1)
+        check(doomed_id is not None, "D5 holder visible before the crash")
+        subprocess.run(restart_hook, shell=True, check=True)
+        check(wait_ready(app1), "D5 app1 back after SIGKILL")
+        th.join(timeout=15)  # the HTTP request died with the process
+        if doomed_id is not None:
+            st, ev = req("GET", app2, f"/locks/events/{doomed_id}")
+            check(st == 200 and ev.get("state") == "interrupted"
+                  and "observation_interrupted" in (ev.get("outcome") or ""),
+                  "D5 crashed holder's record marked observation-interrupted")
+            st, cur = req("GET", app2, "/locks/current")
+            check(st == 200 and not cur["holders"]
+                  and all(h["id"] != doomed_id for h in cur["holders"]),
+                  "D5 restarted instance does not impersonate the dead holder")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--app1", type=int, default=8001)
     parser.add_argument("--app2", type=int, default=8002)
     parser.add_argument("--restart-hook", default=None,
                         help="shell command that restarts the app1 process")
+    parser.add_argument("--timeout-test", action="store_true",
+                        help="also run the busy-timeout test (D4); apps must run with "
+                             "BUSY_TIMEOUT_MS<=10000, e.g. BUSY_TIMEOUT_MS=3000 bash scripts/local_up.sh")
     args = parser.parse_args()
 
     print(f"targets: app1=:{args.app1} app2=:{args.app2}")
@@ -452,6 +675,7 @@ def main():
     phase_a(args.app1, args.app2)
     phase_b(args.app1, args.app2, args.restart_hook)
     phase_c(args.app1, args.app2)
+    phase_d(args.app1, args.app2, args.restart_hook, args.timeout_test)
 
     print(f"\n{CHECKS} checks, {len(FAILURES)} failures")
     if FAILURES:
